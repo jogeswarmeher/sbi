@@ -1,0 +1,82 @@
+import streamlit as st
+import fitz
+import pytesseract
+from pdf2image import convert_from_path
+import cv2
+import numpy as np
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.llms import Ollama
+from langchain.chains import RetrievalQA
+from langchain.docstore.document import Document
+import tempfile
+import os
+
+TESS_LANG = "eng+hin"
+
+st.title("📄 Hindi + English PDF Q&A using Ollama")
+
+uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+
+if uploaded_file:
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        pdf_path = tmp_file.name
+
+    st.success("PDF Uploaded Successfully!")
+
+    # ---------- TEXT EXTRACTION ----------
+    def extract_text(pdf_path):
+        text = ""
+        doc = fitz.open(pdf_path)
+
+        for page in doc:
+            page_text = page.get_text()
+            text += page_text
+
+        # OCR fallback for scanned PDFs
+        if len(text.strip()) < 50:
+            pages = convert_from_path(pdf_path)
+            for page in pages:
+                img = np.array(page)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                text += pytesseract.image_to_string(gray, lang=TESS_LANG)
+
+        return text
+
+
+    st.write("Extracting text...")
+    full_text = extract_text(pdf_path)
+
+    # ---------- CHUNKING ----------
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+
+    docs = [Document(page_content=chunk) for chunk in splitter.split_text(full_text)]
+
+    # ---------- EMBEDDING ----------
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+    vectorstore = FAISS.from_documents(docs, embeddings)
+
+    retriever = vectorstore.as_retriever()
+
+    llm = Ollama(model="llama3")
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever
+    )
+
+    st.success("Ready! Ask your question below 👇")
+
+    question = st.text_input("Ask Question:")
+
+    if question:
+        answer = qa_chain.run(question)
+        st.write("### Answer:")
+        st.write(answer)
