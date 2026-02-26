@@ -1,0 +1,190 @@
+import streamlit as st
+import fitz
+import cv2
+import numpy as np
+import tempfile
+import hashlib
+import os
+import time
+import requests
+import pandas as pd
+from PIL import Image
+
+# ---------------- SURYA IMPORTS ----------------
+from surya.models import load_predictors
+from surya.detection import batch_text_detection
+from surya.recognition import batch_text_recognition
+from surya.layout import batch_layout_detection
+from surya.table_rec import batch_table_recognition
+from surya.common.util import rescale_bbox, expand_bbox
+
+# ---------------- RAG IMPORTS ----------------
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+
+# ---------------- CONFIG ----------------
+OLLAMA_BASE_URL = "http://localhost:8890/v1"
+OLLAMA_MODEL = "meta/llama-3.1-8b-instruct"
+
+st.set_page_config(page_title="Enterprise Document AI", layout="wide")
+st.title("🏢 Enterprise Document AI")
+
+# ---------------- LOAD SURYA MODELS (LOAD ONCE) ----------------
+@st.cache_resource
+def load_surya():
+    return load_predictors()
+
+predictors = load_surya()
+
+# ===============================================================
+# 🧠 DOCUMENT PROCESSOR
+# ===============================================================
+class DocumentProcessor:
+
+    def __init__(self, predictors):
+        self.predictors = predictors
+
+    def pdf_to_images(self, pdf_path):
+        doc = fitz.open(pdf_path)
+        images = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=300)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height, pix.width, pix.n
+            )
+            if pix.n == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+            images.append(img)
+        return images
+
+    def extract_embedded_images(self, pdf_path):
+        doc = fitz.open(pdf_path)
+        extracted = []
+        for page in doc:
+            for img in page.get_images(full=True):
+                xref = img[0]
+                base = doc.extract_image(xref)
+                image_bytes = base["image"]
+                extracted.append(Image.open(tempfile.NamedTemporaryFile(delete=False, suffix=".png")))
+        return extracted
+
+    def process_images(self, images):
+        results = []
+
+        det = batch_text_detection(images, self.predictors)
+        rec = batch_text_recognition(images, det, self.predictors)
+        layout = batch_layout_detection(images, self.predictors)
+        tables = batch_table_recognition(images, layout, self.predictors)
+
+        for i, img in enumerate(images):
+            page_result = {
+                "text": " ".join([r.text for r in rec[i]]),
+                "tables": tables[i],
+                "layout": layout[i],
+                "image": img
+            }
+            results.append(page_result)
+
+        return results
+
+
+# ===============================================================
+# 📊 TABLE EXTRACTOR
+# ===============================================================
+class TableExtractor:
+
+    def extract_dataframe(self, table_result):
+        rows = []
+        for cell in table_result.cells:
+            rows.append([cell.text])
+        df = pd.DataFrame(rows)
+        return df
+
+
+# ===============================================================
+# 📈 CHART ANALYZER
+# ===============================================================
+class ChartAnalyzer:
+
+    def crop_region(self, image, bbox):
+        x1, y1, x2, y2 = map(int, bbox)
+        return image[y1:y2, x1:x2]
+
+    def classify_chart(self, cropped_img):
+        # Simple heuristic classification
+        gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+
+        if np.sum(edges) > 50000:
+            return "Bar Chart"
+        return "Line / Pie Chart"
+
+    def extract_numbers(self, cropped_img, predictors):
+        det = batch_text_detection([cropped_img], predictors)
+        rec = batch_text_recognition([cropped_img], det, predictors)
+        return [r.text for r in rec[0] if any(c.isdigit() for c in r.text)]
+
+
+# ===============================================================
+# 📦 MAIN PIPELINE
+# ===============================================================
+uploaded_file = st.file_uploader("Upload PDF / PNG / JPG", type=["pdf", "png", "jpg", "jpeg"])
+
+if uploaded_file:
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=uploaded_file.name)
+    tmp.write(uploaded_file.read())
+    tmp.close()
+    file_path = tmp.name
+
+    processor = DocumentProcessor(predictors)
+    table_extractor = TableExtractor()
+    chart_analyzer = ChartAnalyzer()
+
+    if file_path.endswith(".pdf"):
+        images = processor.pdf_to_images(file_path)
+    else:
+        img = cv2.imread(file_path)
+        images = [img]
+
+    results = processor.process_images(images)
+
+    all_text = ""
+    for page in results:
+
+        st.subheader("📄 Extracted Text")
+        st.write(page["text"])
+        all_text += page["text"]
+
+        # ---------------- TABLES ----------------
+        if page["tables"]:
+            st.subheader("📊 Detected Tables")
+            for table in page["tables"]:
+                df = table_extractor.extract_dataframe(table)
+                st.dataframe(df)
+                df.to_csv("extracted_table.csv", index=False)
+
+        # ---------------- FIGURES ----------------
+        for block in page["layout"]:
+            if block.label in ["Figure", "Chart"]:
+                st.subheader("📈 Detected Chart")
+
+                crop = chart_analyzer.crop_region(page["image"], block.bbox)
+                st.image(crop)
+
+                chart_type = chart_analyzer.classify_chart(crop)
+                st.write("Chart Type:", chart_type)
+
+                numbers = chart_analyzer.extract_numbers(crop, predictors)
+                st.write("Extracted Numbers:", numbers)
+
+    # ---------------- BUILD RAG ----------------
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
+    docs = [Document(page_content=chunk) for chunk in splitter.split_text(all_text)]
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vectorstore = Chroma.from_documents(docs, embeddings)
+    retriever = vectorstore.as_retriever()
+
+    st.success("✅ Enterprise Processing Complete")
