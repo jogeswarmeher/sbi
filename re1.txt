@@ -1,0 +1,1 @@
+pip install pandas pytesseract langdetect scikit-learn langchain langchain-community chromadb
