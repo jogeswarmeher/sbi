@@ -108,7 +108,7 @@ def build_vectorstore(text_pages: List[str], persist_dir: str):
                 )
             )
 
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL,model_kwargs={"device": DEVICE})
 
     vectorstore = Chroma.from_documents(
         documents=docs,
